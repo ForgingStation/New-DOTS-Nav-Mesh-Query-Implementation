@@ -1,0 +1,119 @@
+using Unity.Entities;
+using Unity.Jobs;
+using Unity.Burst;
+using Unity.Mathematics;
+using Unity.Collections;
+using UnityEngine.Experimental.AI;
+
+public class NavAgent_System_IJobEntityBatch : SystemBase
+{
+    private NavMeshWorld navMeshWorld;
+    private bool navMeshQueryAssigned;
+    private NavMeshQuery query;
+
+    protected override void OnCreate()
+    {
+        navMeshQueryAssigned = false;
+        navMeshWorld = NavMeshWorld.GetDefaultWorld();
+    }
+
+    protected override void OnUpdate()
+    {
+        if (!navMeshQueryAssigned)
+        {
+            query = new NavMeshQuery(navMeshWorld, Allocator.Persistent, NavAgent_GlobalSettings.instance.maxPathNodePoolSize);
+            navMeshQueryAssigned = true;
+        }
+        ComponentTypeHandle<NavAgent_Component> nc = GetComponentTypeHandle<NavAgent_Component>();
+        BufferTypeHandle<NavAgent_Buffer> nb = GetBufferTypeHandle<NavAgent_Buffer>();
+        float3 extents = NavAgent_GlobalSettings.instance.extents;
+        int maxIterations = NavAgent_GlobalSettings.instance.maxIterations;
+        int maxPathSize = NavAgent_GlobalSettings.instance.maxPathSize;
+        EntityQuery navQuery = GetEntityQuery(typeof(NavAgent_Component), typeof(NavAgent_Buffer));
+
+        PathFindingJob pfj = new PathFindingJob
+        {
+            extents = extents,
+            maxIterations = maxIterations,
+            maxPathSize = maxPathSize,
+            query = query,
+            nc = nc,
+            nb = nb
+        };
+        Dependency = pfj.ScheduleParallel(navQuery, 1);
+        navMeshWorld.AddDependency(Dependency);
+    }
+    
+    [BurstCompile]
+    public struct PathFindingJob : IJobEntityBatch
+    {
+        public float3 extents;
+        public int maxIterations;
+        public int maxPathSize;
+        [NativeDisableParallelForRestriction] public NavMeshQuery query;
+        public ComponentTypeHandle<NavAgent_Component> nc;
+        public BufferTypeHandle<NavAgent_Buffer> nb;
+
+        public void Execute(ArchetypeChunk batchInChunk, int batchIndex)
+        {
+            NativeArray<NavAgent_Component> chunkNavigationComponent = batchInChunk.GetNativeArray(nc);
+            BufferAccessor<NavAgent_Buffer> chuckNavigationBufferAccessor = batchInChunk.GetBufferAccessor(nb);
+            for (int i = 0; i < batchInChunk.Count; i++)
+            {
+                NavAgent_Component nac = chunkNavigationComponent[i];
+                NavAgent_Component nacnew = new NavAgent_Component();
+                nacnew = nac;
+                if (!nacnew.routed)
+                {
+                    NavMeshQuery currentQuery = query;
+                    PathQueryStatus status = PathQueryStatus.Failure;
+                    nacnew.nml_FromLocation = currentQuery.MapLocation(nac.fromLocation, extents, 0);
+                    nacnew.nml_ToLocation = currentQuery.MapLocation(nac.toLocation, extents, 0);
+                    if (currentQuery.IsValid(nacnew.nml_FromLocation) && currentQuery.IsValid(nacnew.nml_ToLocation))
+                    {
+                        status = currentQuery.BeginFindPath(nacnew.nml_FromLocation, nacnew.nml_ToLocation, -1);
+                    }
+                    if (status == PathQueryStatus.InProgress)
+                    {
+                        status = currentQuery.UpdateFindPath(maxIterations, out int iterationPerformed);
+                    }
+                    if (status == PathQueryStatus.Success)
+                    {
+                        status = currentQuery.EndFindPath(out int polygonSize);
+                        NativeArray<NavMeshLocation>  res = new NativeArray<NavMeshLocation>(polygonSize, Allocator.Temp);
+                        NativeArray<StraightPathFlags>  straightPathFlag = new NativeArray<StraightPathFlags>(maxPathSize, Allocator.Temp);
+                        NativeArray<float> vertexSide = new NativeArray<float>(maxPathSize, Allocator.Temp);
+                        NativeArray<PolygonId>  polys = new NativeArray<PolygonId>(polygonSize, Allocator.Temp);
+                        int straightPathCount = 0;
+                        currentQuery.GetPathResult(polys);
+                        status = PathUtils.FindStraightPath(
+                                currentQuery,
+                                nacnew.fromLocation,
+                                nacnew.toLocation,
+                                polys,
+                                polygonSize,
+                                ref res,
+                                ref straightPathFlag,
+                                ref vertexSide,
+                                ref straightPathCount,
+                                maxPathSize
+                                );
+                        if (status == PathQueryStatus.Success)
+                        {
+                            for (int j = 0; j < straightPathCount; j++)
+                            {
+                                chuckNavigationBufferAccessor[i].Add(new NavAgent_Buffer { wayPoints = res[j].position });
+                            }
+                            nacnew.routed = true;
+                        }
+                        res.Dispose();
+                        straightPathFlag.Dispose();
+                        polys.Dispose();
+                        vertexSide.Dispose();
+                    }
+                }
+                chunkNavigationComponent[i] = nacnew;
+            }
+        }
+    }
+}
